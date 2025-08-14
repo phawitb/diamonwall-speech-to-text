@@ -221,8 +221,17 @@ HTML_TEMPLATE = r"""
         </svg>
         Transcription Result
       </h2>
-      <div class="bg-gray-50 p-6 rounded-xl border border-gray-200">
-        <p id="transcriptionText" class="text-gray-700 whitespace-pre-wrap"></p>
+      <div class="bg-gray-50 p-6 rounded-xl border border-gray-200 space-y-4">
+        <!-- TH result -->
+        <div>
+          <div class="inline-flex items-center px-2 py-0.5 text-xs font-semibold rounded-full bg-indigo-100 text-indigo-700">TH</div>
+          <p id="transcriptionText" class="mt-2 text-gray-700 whitespace-pre-wrap"></p>
+        </div>
+        <!-- EN result (two-step) -->
+        <div id="translationEnBox" style="display: none;">
+          <div class="inline-flex items-center px-2 py-0.5 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-700">EN (Two-step)</div>
+          <p id="translationEnText" class="mt-2 text-gray-700 whitespace-pre-wrap"></p>
+        </div>
       </div>
     </div>
   </div>
@@ -262,6 +271,8 @@ HTML_TEMPLATE = r"""
   const submitText = document.getElementById('submitText');
   const transcriptionOutput = document.getElementById('transcriptionOutput');
   const transcriptionText = document.getElementById('transcriptionText');
+  const translationEnBox = document.getElementById('translationEnBox');
+  const translationEnText = document.getElementById('translationEnText');
   const ngrokUrlElement = document.getElementById('apiUrl');
   const apiUrlMeta = document.getElementById('apiUrlMeta');
   const modelSelect = document.getElementById('model');
@@ -457,6 +468,15 @@ HTML_TEMPLATE = r"""
         } else {
           transcriptionText.textContent = 'Error: ' + (data.error || 'Unknown error');
         }
+
+        // Show English (two-step) if provided
+        if (data.translation_en) {
+          translationEnText.textContent = data.translation_en;
+          translationEnBox.style.display = 'block';
+        } else {
+          translationEnBox.style.display = 'none';
+        }
+
         transcriptionOutput.style.display = 'block';
 
         updateSubmitButtonState();
@@ -477,6 +497,7 @@ HTML_TEMPLATE = r"""
     } catch (error) {
       console.error('Error during transcription:', error);
       transcriptionText.textContent = 'An unexpected error occurred.';
+      translationEnBox.style.display = 'none';
       transcriptionOutput.style.display = 'block';
       updateSubmitButtonState();
       submitText.textContent = 'Transcribe Audio';
@@ -509,6 +530,19 @@ HTML_TEMPLATE = r"""
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+def _join_english_segments(body):
+    """
+    For two-step responses, join the English 'segments' list into a single string.
+    """
+    try:
+        segs = body.get("segments")
+        if isinstance(segs, list):
+            joined = " ".join(s for s in segs if isinstance(s, str)).strip()
+            return joined if joined else None
+    except Exception:
+        pass
+    return None
 
 @app.route("/transcribe-audio", methods=["POST"])
 def transcribe_audio():
@@ -556,7 +590,7 @@ def transcribe_audio():
         else:
             return jsonify({"error": "Invalid model selected"}), 400
 
-        def normalize(body):
+        def normalize_text(body):
             if isinstance(body, dict):
                 if isinstance(body.get("result"), dict) and "text" in body["result"]:
                     return body["result"]["text"]
@@ -566,6 +600,21 @@ def transcribe_audio():
                     return body["translation"]
             return None
 
+        def success_response(body, include_segments=False):
+            text = normalize_text(body)
+            result = {"transcription": text} if text is not None else {}
+            if include_segments:
+                en_joined = _join_english_segments(body)
+                if en_joined:
+                    result["translation_en"] = en_joined
+            if result:
+                return jsonify(result)
+            # If we got here, body shape is unexpected
+            return jsonify({
+                "error": "Unexpected response shape from transcription service",
+                "upstream_body": body
+            }), 502
+
         # Attempt 1: JSON
         try:
             resp = requests.post(target, json=payload_json, timeout=120)
@@ -574,14 +623,13 @@ def transcribe_audio():
             except ValueError:
                 body = None
 
-            if resp.ok:
-                text = normalize(body) if body is not None else None
-                if text is not None:
-                    return jsonify({"transcription": text})
+            if resp.ok and body is not None:
+                return success_response(body, include_segments=(model == "transcribe-2step"))
+            elif resp.ok:
+                # ok but not JSON
                 return jsonify({
-                    "error": "Unexpected response shape from transcription service",
-                    "upstream_status": resp.status_code,
-                    "upstream_body": body if body is not None else resp.text
+                    "error": "Unexpected non-JSON response from transcription service",
+                    "upstream_body": resp.text
                 }), 502
             else:
                 # 400/415 often indicates wrong content type for this backend -> try form
@@ -608,14 +656,12 @@ def transcribe_audio():
             except ValueError:
                 body2 = None
 
-            if resp2.ok:
-                text = normalize(body2) if body2 is not None else None
-                if text is not None:
-                    return jsonify({"transcription": text})
+            if resp2.ok and body2 is not None:
+                return success_response(body2, include_segments=(model == "transcribe-2step"))
+            elif resp2.ok:
                 return jsonify({
-                    "error": "Unexpected response shape from transcription service (form)",
-                    "upstream_status": resp2.status_code,
-                    "upstream_body": body2 if body2 is not None else resp2.text
+                    "error": "Unexpected non-JSON response from transcription service (form)",
+                    "upstream_body": resp2.text
                 }), 502
             else:
                 return jsonify({
