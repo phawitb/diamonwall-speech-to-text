@@ -13,7 +13,7 @@ app = Flask(__name__)
 CORS(app)
 
 # -----------------------------------------------------------------------------
-# Ngrok URL (fetched periodically from external service)
+# Ngrok URL state (cached, but we can fetch fresh on demand)
 # -----------------------------------------------------------------------------
 ngrok_url = None
 ngrok_url_last_ok = 0.0  # epoch seconds when last successfully updated
@@ -43,12 +43,11 @@ def get_ngrok_tunnel_url_from_service():
 
 def fetch_ngrok_url_periodically():
     """
-    Periodically refresh ngrok URL so the UI always displays the latest.
+    Optional: keep polling in the background.
     If NGROK_URL is set, prefer it and do not poll.
     """
     global ngrok_url, ngrok_url_last_ok
 
-    # If a fixed URL is provided, use it and stop.
     fixed = os.getenv("NGROK_URL", "").strip()
     if fixed:
         ngrok_url = fixed
@@ -56,7 +55,6 @@ def fetch_ngrok_url_periodically():
         print(f"Using NGROK_URL from environment: {ngrok_url}")
         return
 
-    # Otherwise poll the external fetch endpoint
     interval_sec = int(os.getenv("NGROK_REFRESH_SEC", "30"))
     print("Starting ngrok URL poller...")
     while True:
@@ -64,11 +62,12 @@ def fetch_ngrok_url_periodically():
         if url:
             ngrok_url = url
             ngrok_url_last_ok = time.time()
-            print(f"Updated ngrok URL: {ngrok_url}")
+            print(f"Updated ngrok URL (poller): {ngrok_url}")
         else:
-            print("Could not update ngrok URL. Will retry.")
+            print("Poller: could not update ngrok URL. Retrying...")
         time.sleep(interval_sec)
 
+# Start poller as a convenience (safe to keep; endpoint also fetches fresh)
 url_fetch_thread = Thread(target=fetch_ngrok_url_periodically, daemon=True)
 url_fetch_thread.start()
 
@@ -98,6 +97,7 @@ HTML_TEMPLATE = r"""
     <div class="mb-6 bg-gray-50 p-3 rounded-xl border border-gray-200">
       <p class="text-sm font-semibold text-gray-700">Transcription Service URL:</p>
       <p id="apiUrl" class="text-sm text-indigo-500 font-mono break-all"></p>
+      <p id="apiUrlMeta" class="text-xs text-gray-500"></p>
     </div>
 
     <form id="transcription-form" class="space-y-6">
@@ -174,8 +174,7 @@ HTML_TEMPLATE = r"""
                 <line x1="12" x2="12" y1="19" y2="22"/>
               </svg>
             </button>
-            <button type="button" id="playButton" onclick="playRecording()
-"
+            <button type="button" id="playButton" onclick="playRecording()"
                     class="flex items-center justify-center w-12 h-12 rounded-full bg-gray-200 hover:bg-gray-300 text-gray-700 shadow-lg transition-all duration-300"
                     style="display: none;">
               <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"
@@ -264,6 +263,7 @@ HTML_TEMPLATE = r"""
   const transcriptionOutput = document.getElementById('transcriptionOutput');
   const transcriptionText = document.getElementById('transcriptionText');
   const ngrokUrlElement = document.getElementById('apiUrl');
+  const apiUrlMeta = document.getElementById('apiUrlMeta');
   const modelSelect = document.getElementById('model');
   const waitingOverlay = document.getElementById('waitingOverlay');
   const playUploadedBtn = document.getElementById('playUploadedBtn');
@@ -273,11 +273,15 @@ HTML_TEMPLATE = r"""
   fetchNgrokUrl();
 
   function fetchNgrokUrl() {
-    fetch(`${API_BASE_URL}/get_ngrok_url`)
+    // cache-bust with timestamp so proxies don't serve stale content
+    fetch(`${API_BASE_URL}/get_ngrok_url?t=${Date.now()}`)
       .then(r => r.json())
       .then(data => {
         if (data.ngrok_url) {
           ngrokUrlElement.textContent = data.ngrok_url;
+          apiUrlMeta.textContent = data.source
+            ? `source: ${data.source}${data.last_ok ? ' • last_ok: ' + new Date(data.last_ok * 1000).toLocaleString() : ''}`
+            : '';
         } else {
           ngrokUrlElement.textContent = 'Could not fetch URL. Is the server running?';
           ngrokUrlElement.classList.add('text-red-500');
@@ -631,12 +635,31 @@ def transcribe_audio():
 @app.route("/get_ngrok_url", methods=["GET"])
 def get_ngrok_url_endpoint():
     """
-    Returns the cached ngrok URL (refreshed in background).
-    Also includes last_ok timestamp for debugging.
+    Always try to fetch a FRESH URL from the external service when this endpoint
+    is hit (e.g., page refresh). Fallback to env override or cached value.
     """
+    global ngrok_url, ngrok_url_last_ok
+
+    # Highest priority: explicit env override
+    fixed = os.getenv("NGROK_URL", "").strip()
+    if fixed:
+        ngrok_url = fixed
+        ngrok_url_last_ok = time.time()
+        return jsonify({"ngrok_url": ngrok_url, "last_ok": int(ngrok_url_last_ok), "source": "env"})
+
+    # Try fresh fetch every time this endpoint is called
+    fresh = get_ngrok_tunnel_url_from_service()
+    if fresh:
+        ngrok_url = fresh
+        ngrok_url_last_ok = time.time()
+        return jsonify({"ngrok_url": ngrok_url, "last_ok": int(ngrok_url_last_ok), "source": "fresh"})
+
+    # Fallback to cache if fresh fetch failed
     if ngrok_url:
-        return jsonify({"ngrok_url": ngrok_url, "last_ok": int(ngrok_url_last_ok)})
-    return jsonify({"ngrok_url": "URL not available"}), 503
+        return jsonify({"ngrok_url": ngrok_url, "last_ok": int(ngrok_url_last_ok), "source": "cache"}), 206
+
+    # Nothing available
+    return jsonify({"error": "URL not available"}), 503
 
 # -----------------------------------------------------------------------------
 # Run
